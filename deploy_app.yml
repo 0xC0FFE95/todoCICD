@@ -1,0 +1,217 @@
+- name: "Durcissement avancé, Audit Lynis et Déploiement de la Todolist"
+  hosts: my_infra
+  become: yes
+  tasks:
+
+    - name: "1. Mettre à jour le cache APT et les paquets"
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: safe
+
+    - name: "2. Installer les paquets de base (git, python, pip)"
+      ansible.builtin.apt:
+        name:
+          - git
+          - python3
+          - python3-pip
+          - python3-venv
+        state: present
+
+    - name: "2_bis. Installer le pare-feu et les mises à jour auto"
+      ansible.builtin.apt:
+        name:
+          - ufw
+          - unattended-upgrades
+        state: present
+
+    - name: "2_ter. Installer les outils de sécurité, d'audit et Fail2ban (Exercice 18 & Piste 5)"
+      ansible.builtin.apt:
+        name:
+          - lynis
+          - auditd
+          - fail2ban
+        state: present
+
+    - name: "2_quater. Installer les outils de détection de rootkits (Piste 3)"
+      ansible.builtin.apt:
+        name:
+          - rkhunter
+        state: present
+
+    - name: "2_quinquies. Installer les outils de compilation"
+      ansible.builtin.apt:
+        name:
+          - build-essential
+          - python3-dev
+        state: present
+
+    - name: "3. Configurer les mises à jour automatiques de sécurité"
+      ansible.builtin.dpkg_selections:
+        name: unattended-upgrades
+        selection: install
+
+    - name: "4. Créer un utilisateur dédié et non-privilégié 'todolist'"
+      ansible.builtin.user:
+        name: todolist
+        shell: /bin/bash
+        create_home: yes
+        system: no
+
+    - name: "4_bis. Configurer Git safe.directory pour l'utilisateur todolist via runuser"
+      ansible.builtin.command:
+        cmd: runuser -u todolist -- git config --global --add safe.directory /home/todolist/to-do-list-unsecure
+      changed_when: false
+
+    - name: "4_ter. Nettoyer l'ancien dossier pour repartir sur des bases saines"
+      ansible.builtin.file:
+        path: /home/todolist/to-do-list-unsecure
+        state: absent
+
+    - name: "5. Cloner les sources de l'application depuis GitHub"
+      ansible.builtin.git:
+        repo: 'https://github.com/gaeldb/to-do-list-unsecure.git'
+        dest: /home/todolist/to-do-list-unsecure
+        version: main
+        force: yes
+
+    - name: "6. Créer un environnement virtuel Python local"
+      ansible.builtin.command:
+        cmd: python3 -m venv venv
+        chdir: /home/todolist/to-do-list-unsecure/
+      args:
+        creates: /home/todolist/to-do-list-unsecure/venv
+
+    - name: "7. Installer les dépendances Python dans le venv"
+      ansible.builtin.pip:
+        name:
+          - django
+          - gunicorn
+          - pyyaml==5.3.1
+          - requests==2.19.1
+        virtualenv: /home/todolist/to-do-list-unsecure/venv
+
+    - name: "8. Configurer le mode DEBUG selon l'environnement"
+      ansible.builtin.lineinfile:
+        path: /home/todolist/to-do-list-unsecure/todo/settings.py
+        regexp: '^DEBUG\s*='
+        line: 'DEBUG = False'
+      when: inventory_hostname == 'app-prod1'
+
+    - name: "9_bis. Attribuer la propriété des fichiers à l'utilisateur todolist"
+      ansible.builtin.file:
+        path: /home/todolist/to-do-list-unsecure
+        owner: todolist
+        group: todolist
+        recurse: yes
+
+    - name: "9. Exécuter les migrations de la base de données SQLite via runuser"
+      ansible.builtin.command:
+        cmd: runuser -u todolist -- /home/todolist/to-do-list-unsecure/venv/bin/python manage.py migrate
+        chdir: /home/todolist/to-do-list-unsecure/
+
+    - name: "10. Durcir la configuration SSH"
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+      notify: Redémarrer SSH
+
+    - name: "10_bis. Correction finding Lynis : Sécuriser les permissions du fichier sshd_config"
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: "10_ter. Correction finding Lynis : Ajouter un timeout de session inactif (10 minutes)"
+      ansible.builtin.lineinfile:
+        path: /etc/profile.d/timeout.sh
+        create: yes
+        line: 'export TMOUT=600'
+        mode: '0644'
+
+    - name: "10_quater. Restreindre l'accès aux compilateurs (Piste 1 / HRDN-7222)"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: '0750'
+      loop:
+        - /usr/bin/gcc
+        - /usr/bin/g++
+        - /usr/bin/as
+
+    - name: "11. Configurer le pare-feu UFW"
+      community.general.ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+
+    - name: "12. Autoriser SSH et HTTP dans UFW"
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - '22'
+        - '80'
+
+    - name: "12_bis. Activer et démarrer le service Fail2ban (Piste 5)"
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: started
+        enabled: yes
+
+    - name: "13. Créer un service systemd pour Gunicorn exécuté par l'utilisateur 'todolist' avec capacité port 80"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/todolist.service
+        content: |
+          [Unit]
+          Description=Gunicorn daemon for Django Todolist (Secure)
+          After=network.target
+
+          [Service]
+          User=todolist
+          Group=todolist
+          WorkingDirectory=/home/todolist/to-do-list-unsecure
+          ExecStart=/home/todolist/to-do-list-unsecure/venv/bin/gunicorn --bind 0.0.0.0:80 todo.wsgi:application
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: "14. Recharger systemd, activer et démarrer le service Todolist"
+      ansible.builtin.systemd:
+        name: todolist
+        daemon_reload: yes
+        state: restarted
+        enabled: yes
+
+    - name: "15. Valider automatiquement que l'application répond bien"
+      ansible.builtin.uri:
+        url: http://localhost
+        return_content: yes
+        status_code: 200
+      register: web_check
+
+    - name: "17. Exécuter un audit Lynis post-durcissement"
+      ansible.builtin.command:
+        cmd: lynis audit system --quick
+      register: lynis_output_after
+      changed_when: false
+
+    - name: "18. Afficher le nouveau score de durcissement Lynis"
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: "{{ lynis_output_after.stdout_lines | select('match', '.*Hardening index.*') | list }}"
+
+  handlers:
+    - name: Redémarrer SSH
+      ansible.builtin.service:
+        name: ssh
+        state: restarted

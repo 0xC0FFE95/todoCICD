@@ -1,0 +1,14 @@
+all:
+  children:
+    my_infra:
+      hosts:
+        app-dev:
+          ansible_host: 192.168.121.71
+          ansible_user: admin
+          ansible_ssh_private_key_file: ./id-rda-infra.key
+          ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+        app-prod1:
+          ansible_host: 192.168.121.35
+          ansible_user: admin
+          ansible_ssh_private_key_file: ./id-rda-infra.key
+          ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
